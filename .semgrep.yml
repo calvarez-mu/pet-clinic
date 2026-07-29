@@ -1,0 +1,38 @@
+rules:
+  - id: clinic.java.command-injection
+    languages:
+      - java
+    severity: ERROR
+    message: >-
+      Posible inyección de comandos: no entregue datos controlados por el usuario a
+      Runtime.exec. Use una lista permitida y una API que no invoque el shell.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      confidence: HIGH
+      impact: HIGH
+      likelihood: HIGH
+    patterns:
+      - pattern: Runtime.getRuntime().exec($INPUT)
+
+  - id: clinic.java.hardcoded-password
+    languages:
+      - java
+    severity: WARNING
+    message: >-
+      Credencial codificada en el código. Utilice el almacén de secretos de la
+      plataforma y entregue la credencial en tiempo de ejecución.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-798: Use of Hard-coded Credentials"
+      confidence: HIGH
+      impact: MEDIUM
+      likelihood: MEDIUM
+    patterns:
+      - pattern: String $PASSWORD = "$VALUE";
+      - metavariable-regex:
+          metavariable: $PASSWORD
+          regex: (?i).*(password|passwd|pwd|secret|token).*
+

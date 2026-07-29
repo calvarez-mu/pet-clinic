@@ -1,0 +1,255 @@
+name: Clinic DevSecOps CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_control:
+        description: Control que debe fallar para generar evidencia académica
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - sast
+          - sca
+          - image
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clinic-devsecops-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: clinic-petclinic
+  SEMGREP_VERSION: 1.170.0
+
+jobs:
+  devsecops:
+    name: SAST → SCA → Build → Image Security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: 1. Clonar repositorio
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Determinar demostración solicitada
+        id: demo
+        shell: bash
+        env:
+          SELECTED_CONTROL: ${{ inputs.force_control || 'none' }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          control="$SELECTED_CONTROL"
+
+          if [[ "$COMMIT_MESSAGE" == *"[force-sast-fail]"* ]]; then control="sast"; fi
+          if [[ "$COMMIT_MESSAGE" == *"[force-sca-fail]"* ]]; then control="sca"; fi
+          if [[ "$COMMIT_MESSAGE" == *"[force-image-fail]"* ]]; then control="image"; fi
+
+          case "$control" in
+            none|sast|sca|image) ;;
+            *) echo "Control no válido: $control"; exit 2 ;;
+          esac
+
+          echo "control=$control" >> "$GITHUB_OUTPUT"
+          echo "### Ejecución DevSecOps" >> "$GITHUB_STEP_SUMMARY"
+          echo "Control forzado: **$control**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preparar evidencia SAST vulnerable
+        if: steps.demo.outputs.control == 'sast'
+        shell: bash
+        run: |
+          mkdir -p security-evidence
+          cp security-tests/sast/ForcedSastFailure.java.fixture security-evidence/ForcedSastFailure.java
+          echo "Se habilitó una vulnerabilidad controlada para que Semgrep detenga el pipeline."
+
+      - name: Instalar Semgrep
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
+
+      - name: Generar reporte SAST
+        shell: bash
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          mkdir -p reports/semgrep
+          semgrep scan \
+            --config .semgrep.yml \
+            --config p/java \
+            --severity WARNING \
+            --severity ERROR \
+            --json-output reports/semgrep/semgrep.json \
+            .
+
+      - name: 2. SAST con Semgrep (MEDIUM, HIGH, CRITICAL)
+        id: sast
+        continue-on-error: true
+        shell: bash
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan \
+            --config .semgrep.yml \
+            --config p/java \
+            --severity WARNING \
+            --severity ERROR \
+            --error \
+            .
+
+      - name: Publicar reporte SAST
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sast-semgrep-report
+          path: reports/semgrep/semgrep.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preparar análisis SCA
+        id: sca-config
+        shell: bash
+        env:
+          FORCED_CONTROL: ${{ steps.demo.outputs.control }}
+        run: |
+          if [[ "$FORCED_CONTROL" == "sca" ]]; then
+            echo "path=security-tests/sca" >> "$GITHUB_OUTPUT"
+            echo "Se analizará una dependencia vulnerable controlada."
+          else
+            echo "path=." >> "$GITHUB_OUTPUT"
+          fi
+          mkdir -p reports/sca
+
+      - name: Generar reporte SCA
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ steps.sca-config.outputs.path }}
+          format: json
+          output: reports/sca/trivy-sca.json
+          exit-code: "0"
+          vuln-type: library
+          severity: MEDIUM,HIGH,CRITICAL
+          scanners: vuln
+
+      - name: 3. SCA con Trivy (MEDIUM, HIGH, CRITICAL)
+        id: sca
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ steps.sca-config.outputs.path }}
+          format: table
+          exit-code: "1"
+          vuln-type: library
+          severity: MEDIUM,HIGH,CRITICAL
+          scanners: vuln
+          skip-setup-trivy: true
+
+      - name: Publicar reporte SCA
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sca-trivy-report
+          path: reports/sca/trivy-sca.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Seleccionar Dockerfile
+        id: dockerfile
+        shell: bash
+        env:
+          FORCED_CONTROL: ${{ steps.demo.outputs.control }}
+        run: |
+          if [[ "$FORCED_CONTROL" == "image" ]]; then
+            echo "path=security-tests/image/Dockerfile.vulnerable" >> "$GITHUB_OUTPUT"
+            echo "Se construirá la imagen con una base vulnerable controlada."
+          else
+            echo "path=Dockerfile" >> "$GITHUB_OUTPUT"
+          fi
+          mkdir -p reports/trivy
+
+      - name: 4. Construir imagen Docker
+        shell: bash
+        env:
+          DOCKERFILE: ${{ steps.dockerfile.outputs.path }}
+          TAG: ${{ github.sha }}
+        run: docker build --file "$DOCKERFILE" --tag "${IMAGE_NAME}:${TAG}" .
+
+      - name: Generar reporte Image Security
+        if: always()
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: json
+          output: reports/trivy/trivy.json
+          exit-code: "0"
+          vuln-type: os,library
+          severity: MEDIUM,HIGH,CRITICAL
+          scanners: vuln
+          skip-setup-trivy: true
+
+      - name: 5. Image Security con Trivy (MEDIUM, HIGH, CRITICAL)
+        id: image
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: MEDIUM,HIGH,CRITICAL
+          scanners: vuln
+          skip-setup-trivy: true
+
+      - name: Publicar reporte Image Security
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-trivy-report
+          path: reports/trivy/trivy.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Resumen de controles
+        if: always()
+        shell: bash
+        env:
+          SAST_OUTCOME: ${{ steps.sast.outcome }}
+          SCA_OUTCOME: ${{ steps.sca.outcome }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+        run: |
+          echo "| Control | Resultado | Umbral |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SAST / Semgrep | $SAST_OUTCOME | WARNING y ERROR |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SCA / Trivy | $SCA_OUTCOME | MEDIUM, HIGH, CRITICAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image Security / Trivy | $IMAGE_OUTCOME | MEDIUM, HIGH, CRITICAL |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Aplicar gates de seguridad
+        if: always()
+        shell: bash
+        env:
+          SAST_OUTCOME: ${{ steps.sast.outcome }}
+          SCA_OUTCOME: ${{ steps.sca.outcome }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+        run: |
+          failed=0
+
+          if [[ "$SAST_OUTCOME" != "success" ]]; then
+            echo "::error title=Gate SAST bloqueado::Semgrep detectó hallazgos de severidad media o superior."
+            failed=1
+          fi
+          if [[ "$SCA_OUTCOME" != "success" ]]; then
+            echo "::error title=Gate SCA bloqueado::Trivy detectó dependencias MEDIUM, HIGH o CRITICAL."
+            failed=1
+          fi
+          if [[ "$IMAGE_OUTCOME" != "success" ]]; then
+            echo "::error title=Gate Image Security bloqueado::Trivy detectó vulnerabilidades MEDIUM, HIGH o CRITICAL."
+            failed=1
+          fi
+
+          exit "$failed"

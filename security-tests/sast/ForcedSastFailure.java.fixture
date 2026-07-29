@@ -1,0 +1,10 @@
+import java.io.IOException;
+
+final class ForcedSastFailure {
+
+	void executeUntrustedInput(String userInput) throws IOException {
+		Runtime.getRuntime().exec(userInput);
+	}
+
+}
+

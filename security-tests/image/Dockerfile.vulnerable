@@ -10,7 +10,8 @@ RUN --mount=type=cache,target=/root/.m2 \
       -Dcheckstyle.skip=true \
       -Djacoco.skip=true
 
-FROM eclipse-temurin:11-jre-jammy
+# Base antigua intencional para demostrar el bloqueo del gate Image Security.
+FROM eclipse-temurin:11.0.17_8-jre-focal
 
 RUN groupadd --system clinic && useradd --system --gid clinic clinic
 WORKDIR /app
